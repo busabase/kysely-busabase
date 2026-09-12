@@ -60,9 +60,14 @@ describe("comparisons", () => {
     expect(matches(build, row)).toBe(expected);
   });
 
-  it("maps every comparison onto an exact value candidate", () => {
+  it("maps every comparison onto an exact leaf", () => {
     const compiled = compile((db) => db.selectFrom("t").selectAll().where("age", ">", 18));
-    expect(compiled.valueCandidates).toEqual([{ fieldSlug: "age", operator: "gt", value: 18 }]);
+    expect(compiled.valueTree).toEqual({
+      kind: "leaf",
+      fieldSlug: "age",
+      operator: "gt",
+      value: 18,
+    });
     expect(compiled.fullyExact).toBe(true);
   });
 
@@ -130,15 +135,34 @@ describe("lists and patterns", () => {
     ).toBe(true);
   });
 
-  it("treats a single-element `in` as equality, but not a longer list", () => {
+  it("turns an `in` of any length into an OR of equalities", () => {
+    // A longer list used to be unpushable, because value filters were ANDed and
+    // `x = a AND x = b` matches nothing. `valueFilters` takes a CNF now, so the
+    // disjunction goes to the server instead of forcing a full-Base scan.
     expect(
-      compile((db) => db.selectFrom("t").selectAll().where("name", "in", ["kelly"]))
-        .valueCandidates,
-    ).toEqual([{ fieldSlug: "name", operator: "eq", value: "kelly" }]);
+      compile((db) => db.selectFrom("t").selectAll().where("name", "in", ["a", "b"])).valueTree,
+    ).toEqual({
+      kind: "or",
+      nodes: [
+        { kind: "leaf", fieldSlug: "name", operator: "eq", value: "a" },
+        { kind: "leaf", fieldSlug: "name", operator: "eq", value: "b" },
+      ],
+    });
     expect(
-      compile((db) => db.selectFrom("t").selectAll().where("name", "in", ["a", "b"]))
-        .valueCandidates,
-    ).toEqual([]);
+      compile((db) => db.selectFrom("t").selectAll().where("name", "in", ["a", "b"])).fullyExact,
+    ).toBe(true);
+  });
+
+  it("turns a `not in` into an AND of inequalities", () => {
+    expect(
+      compile((db) => db.selectFrom("t").selectAll().where("name", "not in", ["a", "b"])).valueTree,
+    ).toEqual({
+      kind: "and",
+      nodes: [
+        { kind: "leaf", fieldSlug: "name", operator: "ne", value: "a" },
+        { kind: "leaf", fieldSlug: "name", operator: "ne", value: "b" },
+      ],
+    });
   });
 
   it("distinguishes like from ilike", () => {
@@ -170,7 +194,11 @@ describe("boolean structure", () => {
     expect(compiled.fullyExact).toBe(true);
   });
 
-  it("reads OR and refuses to push any branch", () => {
+  it("reads OR as a disjunction the server can decide, but pushes no VIEW filter", () => {
+    // The two halves diverge here, and both are right. `valueFilters` take a
+    // CNF, so the disjunction is exact and goes to the server. View `filters`
+    // are ANDed, so one branch's filter would exclude rows the other branch
+    // matches — nothing may be pushed there.
     const compiled = compile((db) =>
       db
         .selectFrom("t")
@@ -180,7 +208,14 @@ describe("boolean structure", () => {
     expect(compiled.predicate(row)).toBe(true);
     expect(compiled.predicate({ ...row, name: "other" })).toBe(false);
     expect(compiled.pushdown).toEqual([]);
-    expect(compiled.fullyExact).toBe(false);
+    expect(compiled.fullyExact).toBe(true);
+    expect(compiled.valueTree).toEqual({
+      kind: "or",
+      nodes: [
+        { kind: "leaf", fieldSlug: "name", operator: "eq", value: "kelly" },
+        { kind: "leaf", fieldSlug: "name", operator: "eq", value: "sam" },
+      ],
+    });
   });
 
   it("reads NOT, and keeps SQL's NOT UNKNOWN = UNKNOWN", () => {
@@ -193,7 +228,16 @@ describe("boolean structure", () => {
     expect(compiled.predicate(row)).toBe(false);
     expect(compiled.predicate({ ...row, name: "sam" })).toBe(true);
     expect(compiled.predicate({})).toBe(false);
-    expect(compiled.fullyExact).toBe(false);
+    // Local evaluation is still Kleene's NOT (the `{}` case above), while the
+    // exact half rewrites the negation into the leaf. Both readings reject a
+    // record with no `name`, which is what makes the rewrite sound.
+    expect(compiled.fullyExact).toBe(true);
+    expect(compiled.valueTree).toEqual({
+      kind: "leaf",
+      fieldSlug: "name",
+      operator: "ne",
+      value: "kelly",
+    });
   });
 
   it("reads a nested tree", () => {
@@ -216,7 +260,50 @@ describe("boolean structure", () => {
       db.selectFrom("t").selectAll().where("age", ">", 18).where("name", "like", "kel%"),
     );
     expect(compiled.fullyExact).toBe(false);
-    expect(compiled.valueCandidates).toEqual([{ fieldSlug: "age", operator: "gt", value: 18 }]);
+    // The expressible conjunct survives — dropping a conjunct only widens the
+    // row set, and the local predicate re-narrows it.
+    expect(compiled.valueTree).toEqual({
+      kind: "and",
+      nodes: [{ kind: "leaf", fieldSlug: "age", operator: "gt", value: 18 }, { kind: "opaque" }],
+    });
+  });
+});
+
+describe("column-to-column comparisons", () => {
+  // Previously refused. It is ordinary SQL (`whereRef`), it is answerable from
+  // the record payload the driver already holds, and refusing it only pushed the
+  // user into fetching everything and filtering by hand.
+  it("compares two columns of the same record", () => {
+    const compiled = compile((db) =>
+      db
+        .selectFrom("t")
+        .selectAll()
+        .whereRef("age", ">", "score" as never),
+    );
+    expect(compiled.predicate({ age: 30, score: 10 })).toBe(true);
+    expect(compiled.predicate({ age: 10, score: 30 })).toBe(false);
+  });
+
+  it("keeps SQL's UNKNOWN when either side is missing", () => {
+    const compiled = compile((db) =>
+      db
+        .selectFrom("t")
+        .selectAll()
+        .whereRef("age", ">", "score" as never),
+    );
+    expect(compiled.predicate({ age: 30 })).toBe(false);
+    expect(compiled.predicate({})).toBe(false);
+  });
+
+  it("stays out of the exact half — there is no wire form for it", () => {
+    expect(
+      compile((db) =>
+        db
+          .selectFrom("t")
+          .selectAll()
+          .whereRef("age", ">", "score" as never),
+      ).fullyExact,
+    ).toBe(false);
   });
 });
 
@@ -224,17 +311,6 @@ describe("refusals", () => {
   it("rejects a raw sql fragment rather than ignoring it", () => {
     expect(() =>
       compile((db) => db.selectFrom("t").selectAll().where(sql<boolean>`lower(name) = 'x'`)),
-    ).toThrow(UnsupportedWhereError);
-  });
-
-  it("rejects a column-to-column comparison", () => {
-    expect(() =>
-      compile((db) =>
-        db
-          .selectFrom("t")
-          .selectAll()
-          .whereRef("name", "=", "age" as never),
-      ),
     ).toThrow(UnsupportedWhereError);
   });
 
