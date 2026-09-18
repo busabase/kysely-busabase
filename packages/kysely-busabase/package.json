@@ -1,6 +1,6 @@
 {
   "name": "kysely-busabase",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Kysely dialect for Busabase — query a Busabase Base with Kysely's typed query builder, translated to busabase-sdk REST calls.",
   "license": "MIT",
   "homepage": "https://github.com/busabase/kysely-busabase",
@@ -39,7 +39,7 @@
     "lint:err": "biome format . --write && biome check . --write --diagnostic-level=error"
   },
   "dependencies": {
-    "busabase-sdk": "^0.60.0"
+    "busabase-sdk": "^0.70.0"
   },
   "peerDependencies": {
     "kysely": ">=0.28 <1"
